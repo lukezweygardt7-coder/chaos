@@ -1,0 +1,141 @@
+name: Build ChaosCraft - chaos
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Find and extract the uploaded ChaosCraft source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          selected=""
+          shopt -s nullglob
+
+          for archive in "$GITHUB_WORKSPACE"/*.zip; do
+            listing="$(unzip -Z1 "$archive" 2>/dev/null || true)"
+
+            if grep -qE '(^|/)build\.gradle$' <<< "$listing" && \
+               grep -q 'src/main/java/com/chaoscraft/ChaosCraft.java' <<< "$listing"; then
+              selected="$archive"
+              break
+            fi
+          done
+
+          if [[ -z "$selected" ]]; then
+            echo 'No ChaosCraft source ZIP found in the repository root.' >&2
+            echo 'Upload ChaosCraft-Forge1122-Source.zip.' >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/chaoscraft-source"
+          unzip -q "$selected" -d "$RUNNER_TEMP/chaoscraft-source"
+
+          main_file="$(find "$RUNNER_TEMP/chaoscraft-source" -type f -path '*/src/main/java/com/chaoscraft/ChaosCraft.java' -print -quit)"
+
+          if [[ -z "$main_file" ]]; then
+            echo 'Main source marker missing after extraction.' >&2
+            exit 1
+          fi
+
+          project_dir="${main_file%/src/main/java/com/chaoscraft/ChaosCraft.java}"
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+
+          echo "Using source ZIP: $selected"
+          echo "Project directory: $project_dir"
+
+      - name: Install Gradle 7.6.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://services.gradle.org/distributions/gradle-7.6.4-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/gradle-7.6.4/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gradle-7.6.4/bin/gradle" --version
+
+      - name: Build Forge mod
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -o pipefail
+          gradle clean build --no-daemon --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/chaoscraft-build.log"
+
+      - name: Verify compiled JAR and Java 8 bytecode
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          jar_file="$(find build/libs -maxdepth 1 -type f -name '*.jar' ! -name '*-sources.jar' ! -name '*-dev.jar' -print -quit)"
+
+          if [[ -z "$jar_file" ]]; then
+            echo 'No distributable JAR found.' >&2
+            exit 1
+          fi
+
+          unzip -l "$jar_file" | grep -q 'mcmod.info'
+          unzip -l "$jar_file" | grep -q 'com/chaoscraft/ChaosCraft.class'
+          unzip -l "$jar_file" | grep -q 'assets/chaoscraft/textures/items/yeet_stick.png'
+          unzip -l "$jar_file" | grep -q 'assets/chaoscraft/recipes/yeet_stick.json'
+
+          unzip -p "$jar_file" com/chaoscraft/ChaosCraft.class > "$RUNNER_TEMP/ChaosCraft.class"
+
+          python3 - <<'PYCLASS'
+          import os
+          import struct
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "ChaosCraft.class")
+          data = open(path, "rb").read(8)
+
+          if data[:4] != bytes([0xCA, 0xFE, 0xBA, 0xBE]):
+              raise SystemExit("Invalid Java class file")
+
+          major = struct.unpack(">H", data[6:8])[0]
+
+          if major != 52:
+              raise SystemExit("Expected Java 8 bytecode version 52, got %d" % major)
+
+          print("Verified Java 8 class-file version 52")
+          PYCLASS
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$jar_file" "$GITHUB_WORKSPACE/out/ChaosCraft-1.0.0-Forge-1.12.2.jar"
+
+          echo "Verified $jar_file"
+
+      - name: Upload installable mod JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChaosCraft-1.0.0-Forge-1.12.2
+          path: out/ChaosCraft-1.0.0-Forge-1.12.2.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChaosCraft-build-log
+          path: ${{ runner.temp }}/chaoscraft-build.log
+          if-no-files-found: ignore
+          retention-days: 7
